@@ -1,4 +1,3 @@
-# NAR2020
 # Code for Nucleic Acids Research 2020
 
 Snakefile*: Snakemake files for FASTQ analysis  
