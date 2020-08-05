@@ -1,0 +1,148 @@
+#!/usr/local/bin/snakemake
+
+import sys; sys.path.append('/casa/jimkwon/notebooks')
+import time
+
+# 
+# Using jupyter terminal
+#
+
+RAW_DATA_DIR = '/casa/jimkwon/PROJECT/ERH/data/200221_natcomm/analysis'
+
+#SAMPLES = ['1siGFP']
+
+SAMPLES = ['SRR7439004',
+           'SRR7439005',
+           'SRR7439006',
+           'SRR7439007']
+
+#ADAPTER_3P = 'TGGAATTCTCGGGTGCCAAGG'
+ADAPTER_3P = 'AGATCGGAAGAGCACACGTCTGAACTCCAGTCAC'   # NEBNext Small RNA library
+
+MAX_DIFF = 5
+MIN_QUAL = 20
+MIN_QUALIFIED = 90
+MIN_INSERT_LEN = 18
+MAX_INSERT_LEN = 26
+# No random barcode here
+
+#BOWTIE2INDEX = '/casa/jimkwon/data/bowtie2_index/hg38spikeshrek'
+BOWTIE2INDEX = '/casa/jimkwon/data/bowtie2_index_shrek1and2/hg38spikeshrek1and2'
+#GENCODE_GFF = '/casa/jimkwon/data/GENCODE/hg38/gencode.v31.annotation.gff3.gz'
+MIRBASE_GFF = '/casa/jimkwon/data/mirbase/21/genomes/hsa.gff3'
+
+# write a log for each run
+DATE = time.strftime('%y%m%d')
+LOG = 'logs/%s.log' % DATE
+logf = open(LOG, 'a')
+STAMP = '========== NEW RUN at %s ==========\n' % time.time()
+logf.write(STAMP)
+logf.close()
+
+
+rule all:
+    input: 'logs/%s.log' % DATE,
+           expand('data/{sample}.qc.fastq.gz', sample=SAMPLES),
+           expand('data/{sample}.trima.fastq.gz', sample=SAMPLES),
+           expand('data/{sample}.trima_fasta.fastq.gz', sample=SAMPLES),
+	   expand('data/{sample}.insertonly.fastq.gz', sample=SAMPLES),
+           expand('data/{sample}.bt2output.sam', sample=SAMPLES),
+           expand('data/{sample}.bt2output.unsorted.bam', sample=SAMPLES),
+           expand('data/{sample}.bt2output.sorted.bam', sample=SAMPLES),
+           expand('data/{sample}.bt2output.sorted.bam.bai', sample=SAMPLES),
+           expand('annotated/{sample}.mirna.bed', sample=SAMPLES),
+           expand('annotated/{sample}.mirna.count.txt', sample=SAMPLES)
+           # no spike in here!
+
+
+rule make_log:
+    output: 'logs/%s.log' % DATE
+    shell: 'echo "{STAMP}" > {output}'
+
+rule quality_filter:
+    output: 'data/{sample}.qc.fastq.gz'
+    shell: 'zcat {wildcards.sample}.fastq.gz | \
+            fastq_quality_filter - -v -Q33 -q {MIN_QUAL} -p {MIN_QUALIFIED} 2>> {LOG} | \
+            gzip -c - > {output}'
+
+rule trim_adapter:
+    input: 'data/{sample}.qc.fastq.gz'
+    output: 'data/{sample}.trima.fastq.gz'
+    shell: 'zcat {input} | \
+            cutadapt - -a {ADAPTER_3P} --trimmed-only 2>> {LOG} | \
+            gzip -c - > {output}'
+	    
+rule fastq_to_fasta:
+    input: 'data/{sample}.trima.fastq.gz'
+    output: 'data/{sample}.trima_fasta.fastq.gz'
+    shell: 'zcat {input} | \
+            fastq_to_fasta -Q33 -z > {output}'
+
+rule remove_random_sequences:
+    input: 'data/{sample}.trima_fasta.fastq.gz'
+    output: 'data/{sample}.insertonly.fastq.gz'
+    shell: 'zcat {input} | \
+            cutadapt - -m {MIN_INSERT_LEN} -M {MAX_INSERT_LEN} | \
+            gzip -c - > {output}'
+	    
+rule bowtie2_mapping:
+    input: 'data/{sample}.insertonly.fastq.gz'  #bowtie2 can get gziped files as input
+    output: 'data/{sample}.bt2output.sam'
+    params: idx = BOWTIE2INDEX
+    shell: 'bowtie2 -f --local -p 4 --score-min L,-4,2 --ma 2 -k 5 \
+            -U {input} -x {params.idx} -S {output}'
+
+    # -f: input is fasta
+    # --local: ends might be soft clipped
+    # -p: threads
+    # --score-min: min acceptable alignmemt score; L: -0.6, -0.6 for end-to-end
+    # --ma: match bonus; 2 for --local
+    # -k: report up to <int> alns per read
+    # -S: output will be sam
+    # -U: unpaired input file
+#
+# no unique mapped read selection step here
+#
+
+rule sam_to_bam:
+    input: 'data/{sample}.bt2output.sam'
+    output: 'data/{sample}.bt2output.unsorted.bam'
+    threads: 8
+    shell: 'samtools view -bS -@ {threads} {input} > {output}'
+
+rule sort_bam:
+    input: 'data/{sample}.bt2output.unsorted.bam'
+    output: 'data/{sample}.bt2output.sorted.bam'
+    threads: 8
+    shell: 'samtools sort -o {output} -O bam -@ {threads} {input}'
+
+rule index_bam:
+    input: 'data/{sample}.bt2output.sorted.bam'
+    output: 'data/{sample}.bt2output.sorted.bam.bai'
+    shell: 'samtools index -b {input}'
+
+rule bedtools_intersect_on_mirna:
+    input: bam = 'data/{sample}.bt2output.sorted.bam',
+           txpt_ref = MIRBASE_GFF
+    output: 'annotated/{sample}.mirna.bed'
+    shell: 'bedtools intersect -abam {input.bam} -b {input.txpt_ref} -wa -wb -f 0.50 -s -bed | \
+            uniq > {output}'
+
+    # -f: minimum overlap required as a fraction of A
+    # -s: Force "strandedness"
+
+rule get_mirna_count:
+    input: 'annotated/{sample}.mirna.bed'
+    output: 'annotated/{sample}.mirna.count.txt'
+    shell: """
+           grep "miRNA_primary_transcript" {input} | \
+           awk -F "\\t" '{{print $21}}' | \
+           sort | \
+           uniq -c | \
+           sort -nr > {output}
+           """
+
+""" for later use, keep below grammer:
+           awk -F "\\t" '{{OFS="\\t"; print $21, $4}}'
+"""
+
